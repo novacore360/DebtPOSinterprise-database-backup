@@ -43,7 +43,43 @@ Is it 8:00 AM or 8:00 PM PHT?
 
 ---
 
-## Setup
+## Catch-Up on Missed Backups (Free-Tier Sleep Protection)
+
+If this service runs on a platform that sleeps when idle (e.g. Render free tier), the cron scheduler is also asleep — so if nobody hits the URL right at 8:00 or 20:00, that backup is silently skipped, **and it won't run itself when the server later wakes up**.
+
+To fix this, every request to `/`, `/health`, or `/status` (plus every cron tick) triggers a **catch-up check**:
+
+```
+Request comes in (e.g. you open the URL at 8:10)
+    │
+    ▼
+What's the most recent scheduled slot? (today 8 AM/8 PM, or yesterday's)
+    │
+    ▼
+Is "now" within the grace window of that slot? (default 180 min)
+    │
+    ├── No  → Too late, do nothing — wait for next real slot
+    │
+    └── Yes
+           │
+           ▼
+    Has a backup already run for that slot? (checks __global__ marker doc)
+           │
+           ├── Yes → Already covered, do nothing
+           │
+           └── No  → Run the backup now, labeled "catchup:<source>"
+```
+
+This relies on a small marker document, `__backup_metadata__/__global__`, written every time `runBackup()` finishes — separate from the per-collection metadata, since that only updates when there are actual data changes to write.
+
+**Config:**
+```env
+CATCHUP_GRACE_MINUTES=180   # how late a catch-up is still allowed to run (default 3 hours)
+```
+
+> Note: this is a safety net, not a fix for the underlying problem. If your service sleeps and nobody visits it within the grace window, that backup is still missed — the real fix is deploying as a Background Worker (see below) or pinging it with an external uptime monitor (e.g. UptimeRobot, cron-job.org) around 8:00/20:00 PHT.
+
+
 
 ### 1. Get Service Account Keys
 
@@ -78,6 +114,9 @@ COLLECTIONS=customers,purchases,products
 TZ=Asia/Manila
 BACKUP_HOUR_1=8
 BACKUP_HOUR_2=20
+
+# Catch-up grace window (minutes) — see "Catch-Up on Missed Backups" above
+CATCHUP_GRACE_MINUTES=180
 ```
 
 > ⚠️ **Important:** When pasting `private_key` in `.env`, keep it as one line with literal `\n` (not real newlines). The code handles the conversion.
