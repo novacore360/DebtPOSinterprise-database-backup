@@ -1,19 +1,16 @@
 require("dotenv").config();
 const admin = require("firebase-admin");
 const cron = require("node-cron");
+const http = require("http");
 
 // ─────────────────────────────────────────────
 // 1. Firebase App Initialization
 // ─────────────────────────────────────────────
 
-/**
- * Parse private key from env (handles escaped newlines from Render env vars)
- */
 function parsePrivateKey(raw) {
   return raw.replace(/\\n/g, "\n");
 }
 
-// Primary Firebase App
 const primaryApp = admin.initializeApp(
   {
     credential: admin.credential.cert({
@@ -25,7 +22,6 @@ const primaryApp = admin.initializeApp(
   "primary"
 );
 
-// Backup Firebase App
 const backupApp = admin.initializeApp(
   {
     credential: admin.credential.cert({
@@ -50,6 +46,7 @@ const COLLECTIONS = (process.env.COLLECTIONS || "customers,purchases,products")
   .filter(Boolean);
 
 const METADATA_COLLECTION = "__backup_metadata__";
+const PORT = process.env.PORT || 3000;
 
 // ─────────────────────────────────────────────
 // 3. Logger
@@ -66,13 +63,20 @@ function log(level, message, data = null) {
 }
 
 // ─────────────────────────────────────────────
-// 4. Metadata Helpers
+// 4. Backup state (for status endpoint)
 // ─────────────────────────────────────────────
 
-/**
- * Read the last-synced metadata from the BACKUP database.
- * Metadata stores: { [collection]: { lastDocCount, lastSyncedAt, docChecksums: { [docId]: updatedAt } } }
- */
+const backupState = {
+  lastRun: null,
+  lastResults: null,
+  isRunning: false,
+  nextRun: null,
+};
+
+// ─────────────────────────────────────────────
+// 5. Metadata Helpers
+// ─────────────────────────────────────────────
+
 async function readBackupMetadata(collectionName) {
   try {
     const doc = await backupDB
@@ -87,9 +91,6 @@ async function readBackupMetadata(collectionName) {
   }
 }
 
-/**
- * Write updated metadata to backup DB after a successful sync.
- */
 async function writeBackupMetadata(collectionName, metadata) {
   await backupDB
     .collection(METADATA_COLLECTION)
@@ -98,44 +99,33 @@ async function writeBackupMetadata(collectionName, metadata) {
 }
 
 // ─────────────────────────────────────────────
-// 5. Core Sync Logic (per collection)
+// 6. Core Sync Logic
 // ─────────────────────────────────────────────
 
-/**
- * Build a simple checksum map: { docId -> updatedAt ISO string (or createdAt fallback) }
- * Used to detect which documents actually changed since last backup.
- */
 function buildChecksumMap(docs) {
   const map = {};
   for (const doc of docs) {
     const data = doc.data();
-    // Use Firestore server timestamps if available; fallback to a hash of stringified data
     const ts =
       data?.updatedAt?.toDate?.()?.toISOString() ||
       data?.updated_at?.toDate?.()?.toISOString() ||
       data?.createdAt?.toDate?.()?.toISOString() ||
       data?.created_at?.toDate?.()?.toISOString() ||
-      JSON.stringify(data).length.toString(); // last-resort: data size as dirty flag
+      JSON.stringify(data).length.toString();
     map[doc.id] = ts;
   }
   return map;
 }
 
-/**
- * Sync a single collection from primary → backup.
- * Returns stats object: { reads, writes, deletes, skipped, status }
- */
 async function syncCollection(collectionName) {
   const stats = { reads: 0, writes: 0, deletes: 0, skipped: 0, status: "ok" };
 
   log("info", `━━━ Syncing collection: [${collectionName}] ━━━`);
 
-  // ── Step 1: Read metadata from BACKUP (1 read, cheap) ──
   const meta = await readBackupMetadata(collectionName);
   const previousChecksums = meta?.docChecksums || {};
   log("info", `  Metadata loaded. Previously tracked ${Object.keys(previousChecksums).length} docs.`);
 
-  // ── Step 2: Read ALL docs from PRIMARY ──
   let primarySnapshot;
   try {
     primarySnapshot = await primaryDB.collection(collectionName).get();
@@ -146,7 +136,6 @@ async function syncCollection(collectionName) {
     return stats;
   }
 
-  // ── Step 3: Guard – skip if primary collection is empty ──
   if (primarySnapshot.empty) {
     log("warn", `  [${collectionName}] is EMPTY in primary. Skipping to avoid data loss.`);
     stats.status = "skipped_empty";
@@ -156,11 +145,9 @@ async function syncCollection(collectionName) {
   const primaryDocs = primarySnapshot.docs;
   const currentChecksums = buildChecksumMap(primaryDocs);
 
-  // ── Step 4: Diff – find what changed ──
   const toUpsert = [];
   const toDelete = [];
 
-  // Docs to add or update
   for (const doc of primaryDocs) {
     const prev = previousChecksums[doc.id];
     const curr = currentChecksums[doc.id];
@@ -171,7 +158,6 @@ async function syncCollection(collectionName) {
     }
   }
 
-  // Docs deleted from primary (exist in old meta but not in current primary)
   const currentIds = new Set(primaryDocs.map((d) => d.id));
   for (const oldId of Object.keys(previousChecksums)) {
     if (!currentIds.has(oldId)) {
@@ -179,7 +165,7 @@ async function syncCollection(collectionName) {
     }
   }
 
-  log("info", `  Diff result → upsert: ${toUpsert.length}, delete: ${toDelete.length}, unchanged: ${stats.skipped}`);
+  log("info", `  Diff → upsert: ${toUpsert.length}, delete: ${toDelete.length}, unchanged: ${stats.skipped}`);
 
   if (toUpsert.length === 0 && toDelete.length === 0) {
     log("info", `  No changes detected for [${collectionName}]. Nothing to write.`);
@@ -187,10 +173,8 @@ async function syncCollection(collectionName) {
     return stats;
   }
 
-  // ── Step 5: Write changes to BACKUP in batches (max 500 ops/batch) ──
-  const BATCH_LIMIT = 400; // safe margin under Firestore's 500 limit
+  const BATCH_LIMIT = 400;
 
-  // Upserts
   for (let i = 0; i < toUpsert.length; i += BATCH_LIMIT) {
     const chunk = toUpsert.slice(i, i + BATCH_LIMIT);
     const batch = backupDB.batch();
@@ -203,7 +187,6 @@ async function syncCollection(collectionName) {
     log("info", `  ✓ Upserted batch of ${chunk.length} docs.`);
   }
 
-  // Deletes (only when primary is NOT empty — guarded above)
   for (let i = 0; i < toDelete.length; i += BATCH_LIMIT) {
     const chunk = toDelete.slice(i, i + BATCH_LIMIT);
     const batch = backupDB.batch();
@@ -216,7 +199,6 @@ async function syncCollection(collectionName) {
     log("info", `  ✓ Deleted batch of ${chunk.length} stale docs.`);
   }
 
-  // ── Step 6: Update metadata in backup ──
   await writeBackupMetadata(collectionName, {
     docChecksums: currentChecksums,
     lastDocCount: primaryDocs.length,
@@ -229,10 +211,16 @@ async function syncCollection(collectionName) {
 }
 
 // ─────────────────────────────────────────────
-// 6. Master Backup Runner
+// 7. Master Backup Runner
 // ─────────────────────────────────────────────
 
 async function runBackup() {
+  if (backupState.isRunning) {
+    log("warn", "Backup already in progress, skipping.");
+    return;
+  }
+
+  backupState.isRunning = true;
   const startTime = Date.now();
   const phTime = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" });
 
@@ -240,7 +228,6 @@ async function runBackup() {
   log("info", "║       FIREBASE POS BACKUP STARTED        ║");
   log("info", `║  ${phTime.padEnd(40)}║`);
   log("info", "╚══════════════════════════════════════════╝");
-  log("info", `Collections to sync: ${COLLECTIONS.join(", ")}`);
 
   const results = {};
 
@@ -255,34 +242,24 @@ async function runBackup() {
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
 
-  log("info", "╔══════════════════════════════════════════╗");
-  log("info", "║          BACKUP SUMMARY                  ║");
-  log("info", "╚══════════════════════════════════════════╝");
-
   let totalReads = 0, totalWrites = 0, totalDeletes = 0;
-  for (const [col, stat] of Object.entries(results)) {
-    log("info", `  [${col}]`, stat);
+  for (const stat of Object.values(results)) {
     totalReads += stat.reads || 0;
     totalWrites += stat.writes || 0;
     totalDeletes += stat.deletes || 0;
   }
 
-  log("info", `  ─── Totals ───`);
-  log("info", `  Reads:   ${totalReads}`);
-  log("info", `  Writes:  ${totalWrites}`);
-  log("info", `  Deletes: ${totalDeletes}`);
-  log("info", `  Elapsed: ${elapsed}s`);
-  log("info", "══════════════════════════════════════════");
+  log("info", `Backup complete — reads: ${totalReads}, writes: ${totalWrites}, deletes: ${totalDeletes}, elapsed: ${elapsed}s`);
+
+  backupState.lastRun = new Date().toISOString();
+  backupState.lastResults = { results, totalReads, totalWrites, totalDeletes, elapsedSeconds: elapsed };
+  backupState.isRunning = false;
 }
 
 // ─────────────────────────────────────────────
-// 7. Time-gate: Only run during backup window
+// 8. Time-gate
 // ─────────────────────────────────────────────
 
-/**
- * Cron fires every minute, but we only proceed if we're within
- * the first minute of the scheduled hour (PHT).
- */
 function isBackupTime() {
   const now = new Date();
   const phHour = parseInt(
@@ -300,39 +277,103 @@ function isBackupTime() {
   return phMinute === 0 && (phHour === hour1 || phHour === hour2);
 }
 
+function getNextBackupTime() {
+  const now = new Date();
+  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "8", 10);
+  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "20", 10);
+
+  const phNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Manila" }));
+  const phHour = phNow.getHours();
+  const phMin = phNow.getMinutes();
+
+  let nextHour;
+  if (phHour < hour1 || (phHour === hour1 && phMin === 0)) nextHour = hour1;
+  else if (phHour < hour2 || (phHour === hour2 && phMin === 0)) nextHour = hour2;
+  else nextHour = hour1 + 24;
+
+  const next = new Date(phNow);
+  next.setHours(nextHour, 0, 0, 0);
+  return next.toLocaleString("en-PH", { timeZone: "Asia/Manila" });
+}
+
 // ─────────────────────────────────────────────
-// 8. Cron Schedule
+// 9. HTTP Server (required for Render Web Service)
+// ─────────────────────────────────────────────
+
+const server = http.createServer((req, res) => {
+  const url = req.url;
+
+  // Health check — Render pings this to keep the service alive
+  if (url === "/" || url === "/health") {
+    const phTime = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      status: "ok",
+      service: "Firebase POS Backup",
+      currentTimePHT: phTime,
+      nextBackup: getNextBackupTime(),
+      isRunning: backupState.isRunning,
+      lastRun: backupState.lastRun,
+    }));
+    return;
+  }
+
+  // Status page — shows last backup results
+  if (url === "/status") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      service: "Firebase POS Backup",
+      collections: COLLECTIONS,
+      currentTimePHT: new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" }),
+      nextBackup: getNextBackupTime(),
+      isRunning: backupState.isRunning,
+      lastRun: backupState.lastRun,
+      lastResults: backupState.lastResults,
+    }, null, 2));
+    return;
+  }
+
+  // Manual trigger — useful for testing
+  if (url === "/trigger" && req.method === "POST") {
+    if (backupState.isRunning) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Backup already in progress" }));
+      return;
+    }
+    res.writeHead(202, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ message: "Backup triggered manually" }));
+    runBackup().catch((err) => log("error", `Manual trigger error: ${err.message}`));
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not found" }));
+});
+
+server.listen(PORT, () => {
+  log("info", `HTTP server listening on port ${PORT}`);
+  log("info", `  GET  /health  — health check`);
+  log("info", `  GET  /status  — last backup results`);
+  log("info", `  POST /trigger — run backup now (for testing)`);
+});
+
+// ─────────────────────────────────────────────
+// 10. Cron Schedule
 // ─────────────────────────────────────────────
 
 log("info", "Firebase POS Backup Service starting...");
-log("info", `Scheduled backups: 08:00 PHT and 20:00 PHT`);
+log("info", `Scheduled: 08:00 PHT and 20:00 PHT daily`);
 log("info", `Collections: ${COLLECTIONS.join(", ")}`);
-log("info", "Waiting for next scheduled window...\n");
 
-// Run every minute; the time-gate inside decides whether to proceed.
-// This avoids relying on server clock timezone alignment.
 cron.schedule(
   "* * * * *",
   async () => {
-    if (!isBackupTime()) return; // silent skip — not backup time yet
+    if (!isBackupTime()) return;
     try {
       await runBackup();
     } catch (err) {
       log("error", `Fatal backup error: ${err.message}`);
     }
   },
-  {
-    timezone: "Asia/Manila",
-  }
+  { timezone: "Asia/Manila" }
 );
-
-// Keep process alive on Render's free tier (optional heartbeat log)
-setInterval(() => {
-  const phTime = new Date().toLocaleString("en-PH", {
-    timeZone: "Asia/Manila",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: true,
-  });
-  process.stdout.write(`\r[Heartbeat] PHT: ${phTime} — waiting for next backup window...`);
-}, 60_000);
