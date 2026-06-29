@@ -98,6 +98,41 @@ async function writeBackupMetadata(collectionName, metadata) {
     .set(metadata, { merge: true });
 }
 
+// Global "last run" marker — written every time runBackup() completes,
+// regardless of whether any collection actually had changes.
+// Per-collection lastSyncedAt only updates on writes, so it's NOT a
+// reliable signal for "did a backup attempt happen at 8/20". This is.
+const GLOBAL_META_DOC = "__global__";
+
+async function readLastGlobalRun() {
+  try {
+    const doc = await backupDB
+      .collection(METADATA_COLLECTION)
+      .doc(GLOBAL_META_DOC)
+      .get();
+    if (!doc.exists) return null;
+    const data = doc.data();
+    return data?.lastRunAt ? new Date(data.lastRunAt) : null;
+  } catch (err) {
+    log("warn", `Could not read global run marker: ${err.message}`);
+    return null;
+  }
+}
+
+async function writeLastGlobalRun(triggeredBy) {
+  try {
+    await backupDB
+      .collection(METADATA_COLLECTION)
+      .doc(GLOBAL_META_DOC)
+      .set(
+        { lastRunAt: new Date().toISOString(), triggeredBy },
+        { merge: true }
+      );
+  } catch (err) {
+    log("warn", `Could not write global run marker: ${err.message}`);
+  }
+}
+
 // ─────────────────────────────────────────────
 // 6. Core Sync Logic
 // ─────────────────────────────────────────────
@@ -214,7 +249,7 @@ async function syncCollection(collectionName) {
 // 7. Master Backup Runner
 // ─────────────────────────────────────────────
 
-async function runBackup() {
+async function runBackup(triggeredBy = "scheduled") {
   if (backupState.isRunning) {
     log("warn", "Backup already in progress, skipping.");
     return;
@@ -227,6 +262,7 @@ async function runBackup() {
   log("info", "╔══════════════════════════════════════════╗");
   log("info", "║       FIREBASE POS BACKUP STARTED        ║");
   log("info", `║  ${phTime.padEnd(40)}║`);
+  log("info", `║  Triggered by: ${triggeredBy.padEnd(27)}║`);
   log("info", "╚══════════════════════════════════════════╝");
 
   const results = {};
@@ -252,7 +288,10 @@ async function runBackup() {
   log("info", `Backup complete — reads: ${totalReads}, writes: ${totalWrites}, deletes: ${totalDeletes}, elapsed: ${elapsed}s`);
 
   backupState.lastRun = new Date().toISOString();
-  backupState.lastResults = { results, totalReads, totalWrites, totalDeletes, elapsedSeconds: elapsed };
+  backupState.lastResults = { results, totalReads, totalWrites, totalDeletes, elapsedSeconds: elapsed, triggeredBy };
+
+  await writeLastGlobalRun(triggeredBy);
+
   backupState.isRunning = false;
 }
 
@@ -296,6 +335,114 @@ function getNextBackupTime() {
   return next.toLocaleString("en-PH", { timeZone: "Asia/Manila" });
 }
 
+// Returns a real JS Date (true UTC instant) for the most recent scheduled
+// slot (8/20 PHT by default) that is <= now. PH has a fixed UTC+8 offset
+// (no DST), so we convert PH wall-clock parts to a UTC instant explicitly
+// rather than relying on locale-string round-tripping, which silently
+// produces wrong deltas when the server's own timezone isn't UTC/PH.
+const PH_OFFSET_MINUTES = 8 * 60;
+
+function getPhWallClockParts(date) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Manila",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  return {
+    year: parseInt(map.year, 10),
+    month: parseInt(map.month, 10),
+    day: parseInt(map.day, 10),
+    hour: parseInt(map.hour, 10) % 24, // Intl can emit "24" for midnight
+    minute: parseInt(map.minute, 10),
+  };
+}
+
+// Builds the true UTC instant corresponding to a given PH wall-clock time.
+function phWallClockToUTC(year, month, day, hour, minute) {
+  return new Date(
+    Date.UTC(year, month - 1, day, hour, minute, 0) - PH_OFFSET_MINUTES * 60000
+  );
+}
+
+function getMostRecentScheduledSlot() {
+  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "8", 10);
+  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "20", 10);
+
+  const now = new Date();
+  const { year, month, day } = getPhWallClockParts(now);
+
+  const candidates = [];
+  // Check today's two slots and yesterday's two slots — covers all cases
+  // (e.g. it's 1 AM PHT, so the most recent slot was yesterday 8 PM PHT).
+  for (const dayOffset of [0, -1]) {
+    // Use a UTC-space Date purely to do safe calendar-day arithmetic.
+    const dayBase = new Date(Date.UTC(year, month - 1, day + dayOffset));
+    for (const h of [hour1, hour2]) {
+      candidates.push(
+        phWallClockToUTC(
+          dayBase.getUTCFullYear(),
+          dayBase.getUTCMonth() + 1,
+          dayBase.getUTCDate(),
+          h,
+          0
+        )
+      );
+    }
+  }
+
+  const pastSlots = candidates.filter((d) => d.getTime() <= now.getTime());
+  pastSlots.sort((a, b) => b.getTime() - a.getTime());
+  return pastSlots[0];
+}
+
+// Grace window (minutes) after a scheduled slot during which a missed
+// backup will still be caught up if the server was asleep at the exact time.
+const CATCHUP_GRACE_MINUTES = parseInt(process.env.CATCHUP_GRACE_MINUTES ?? "180", 10);
+
+let catchUpCheckInFlight = false;
+
+// Call this from the cron tick AND from incoming HTTP requests.
+// Cheap by design — only does a Firestore read (readLastGlobalRun) unless
+// a catch-up is actually warranted.
+async function checkAndRunCatchUp(triggeredBy) {
+  if (backupState.isRunning || catchUpCheckInFlight) return;
+
+  catchUpCheckInFlight = true;
+  try {
+    const mostRecentSlot = getMostRecentScheduledSlot();
+    const minutesSinceSlot = (Date.now() - mostRecentSlot.getTime()) / 60000;
+
+    if (minutesSinceSlot > CATCHUP_GRACE_MINUTES) {
+      // Too late — don't run a backup hours late just because someone
+      // visited the site; wait for the next real scheduled slot instead.
+      return;
+    }
+
+    const lastGlobalRun = await readLastGlobalRun();
+
+    if (lastGlobalRun && lastGlobalRun.getTime() >= mostRecentSlot.getTime()) {
+      // Already ran for this slot (either on time, or already caught up).
+      return;
+    }
+
+    log(
+      "warn",
+      `Catch-up: missed scheduled backup for ${mostRecentSlot.toLocaleString("en-PH", { timeZone: "Asia/Manila" })}. Running now (triggered by ${triggeredBy}).`
+    );
+    await runBackup(`catchup:${triggeredBy}`);
+  } catch (err) {
+    log("error", `Catch-up check failed: ${err.message}`);
+  } finally {
+    catchUpCheckInFlight = false;
+  }
+}
+
 // ─────────────────────────────────────────────
 // 9. HTTP Server (required for Render Web Service)
 // ─────────────────────────────────────────────
@@ -303,8 +450,14 @@ function getNextBackupTime() {
 const server = http.createServer((req, res) => {
   const url = req.url;
 
-  // Health check — Render pings this to keep the service alive
+  // Health check — Render pings this to keep the service alive.
+  // Also doubles as a wake-up trigger: if the server was asleep through
+  // a scheduled backup time, visiting this fires a catch-up check.
   if (url === "/" || url === "/health") {
+    checkAndRunCatchUp("http_health_check").catch((err) =>
+      log("error", `Catch-up trigger error: ${err.message}`)
+    );
+
     const phTime = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
@@ -320,6 +473,10 @@ const server = http.createServer((req, res) => {
 
   // Status page — shows last backup results
   if (url === "/status") {
+    checkAndRunCatchUp("http_status_check").catch((err) =>
+      log("error", `Catch-up trigger error: ${err.message}`)
+    );
+
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       service: "Firebase POS Backup",
@@ -342,7 +499,7 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(202, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ message: "Backup triggered manually" }));
-    runBackup().catch((err) => log("error", `Manual trigger error: ${err.message}`));
+    runBackup("manual").catch((err) => log("error", `Manual trigger error: ${err.message}`));
     return;
   }
 
@@ -368,12 +525,19 @@ log("info", `Collections: ${COLLECTIONS.join(", ")}`);
 cron.schedule(
   "* * * * *",
   async () => {
-    if (!isBackupTime()) return;
-    try {
-      await runBackup();
-    } catch (err) {
-      log("error", `Fatal backup error: ${err.message}`);
+    if (isBackupTime()) {
+      try {
+        await runBackup("scheduled");
+      } catch (err) {
+        log("error", `Fatal backup error: ${err.message}`);
+      }
+      return;
     }
+    // Fallback: server was awake but for some reason missed the exact
+    // :00 minute (e.g. brief downtime, deploy restart, clock drift).
+    checkAndRunCatchUp("cron_tick").catch((err) =>
+      log("error", `Catch-up trigger error: ${err.message}`)
+    );
   },
   { timezone: "Asia/Manila" }
 );
