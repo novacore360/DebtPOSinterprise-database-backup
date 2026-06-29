@@ -45,7 +45,10 @@ const COLLECTIONS = (process.env.COLLECTIONS || "customers,purchases,products")
   .map((c) => c.trim())
   .filter(Boolean);
 
-const METADATA_COLLECTION = "__backup_metadata__";
+// NOTE: Firestore reserves any collection/document ID matching __*__
+// (leading + trailing double underscore) and rejects it with
+// INVALID_ARGUMENT. Must NOT use that pattern here.
+const METADATA_COLLECTION = "_backup_metadata";
 const PORT = process.env.PORT || 3000;
 
 // ─────────────────────────────────────────────
