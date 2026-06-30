@@ -5,6 +5,8 @@ const {
   getFirestore: getClientFirestore,
   collection: fsCollection,
   getDocs,
+  Timestamp: ClientTimestamp,
+  GeoPoint: ClientGeoPoint,
 } = require("firebase/firestore");
 const cron = require("node-cron");
 const http = require("http");
@@ -272,6 +274,57 @@ async function writeCollectionMeta(collectionName, metadata) {
 // 8. CORE SYNC LOGIC
 // ═════════════════════════════════════════════════════════════════════════════
 
+// ─────────────────────────────────────────────────────────────────────────
+// Cross-SDK data sanitizer
+// ─────────────────────────────────────────────────────────────────────────
+// The primary side reads documents using the CLIENT SDK (firebase/firestore),
+// while the backup side writes using the ADMIN SDK (firebase-admin). Both
+// SDKs have their own separate `Timestamp` and `GeoPoint` classes — even
+// though they represent the same data, they are NOT the same class, so the
+// Admin SDK's `.set()` rejects them with:
+//   "Detected an object of type 'Timestamp' that doesn't match the
+//    expected instance ... Firestore types ... from the same NPM package."
+//
+// Fix: recursively walk the document and convert any client-SDK Timestamp
+// into a plain JS Date (Admin SDK auto-converts Date -> its own Timestamp
+// on write — this is the one type both SDKs agree on), and any client-SDK
+// GeoPoint into a plain {latitude, longitude} object reconstructed with the
+// Admin SDK's own GeoPoint class.
+function sanitizeForAdminSDK(value) {
+  if (value === null || value === undefined) return value;
+
+  // Client SDK Timestamp -> plain JS Date
+  if (value instanceof ClientTimestamp) {
+    return value.toDate();
+  }
+
+  // Client SDK GeoPoint -> Admin SDK GeoPoint
+  if (value instanceof ClientGeoPoint) {
+    return new admin.firestore.GeoPoint(value.latitude, value.longitude);
+  }
+
+  // Already a plain Date (shouldn't normally appear from client SDK reads,
+  // but harmless to pass through untouched).
+  if (value instanceof Date) return value;
+
+  // Arrays — sanitize each element.
+  if (Array.isArray(value)) {
+    return value.map(sanitizeForAdminSDK);
+  }
+
+  // Plain objects — sanitize each field recursively.
+  if (typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = sanitizeForAdminSDK(v);
+    }
+    return out;
+  }
+
+  // Primitives (string, number, boolean) pass through unchanged.
+  return value;
+}
+
 function buildChecksumMap(docs) {
   const map = {};
   for (const doc of docs) {
@@ -341,7 +394,8 @@ async function syncCollection(collectionName) {
     const chunk = toUpsert.slice(i, i + BATCH_LIMIT);
     const batch = backupDB.batch();
     for (const doc of chunk) {
-      batch.set(backupDB.collection(collectionName).doc(doc.id), doc.data(), { merge: true });
+      const sanitizedData = sanitizeForAdminSDK(doc.data());
+      batch.set(backupDB.collection(collectionName).doc(doc.id), sanitizedData, { merge: true });
     }
     await batch.commit();
     stats.writes += chunk.length;
