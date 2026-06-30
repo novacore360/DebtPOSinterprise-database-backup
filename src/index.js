@@ -9,15 +9,13 @@ const {
 const cron = require("node-cron");
 const http = require("http");
 
-// ─────────────────────────────────────────────
-// 1. Firebase App Initialization
-// ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. FIREBASE INITIALIZATION
+// ═════════════════════════════════════════════════════════════════════════════
 
-// PRIMARY — client SDK with your web config.
-// Reads are governed by your public Firestore security rules, which acts
-// as a natural safety guard: if these credentials are ever accidentally
-// swapped to point at the empty backup DB, the rules there will deny reads
-// (or return nothing), preventing a blank overwrite of your primary data.
+// PRIMARY — client SDK (web config). Reads only, governed by your public
+// Firestore security rules. Natural data-loss guard: if credentials are ever
+// accidentally swapped, the backup DB's rules block reads before any wipe.
 const primaryClientApp = initClientApp(
   {
     apiKey:            process.env.PRIMARY_API_KEY,
@@ -31,12 +29,8 @@ const primaryClientApp = initClientApp(
 );
 const primaryDB = getClientFirestore(primaryClientApp);
 
-// BACKUP — Admin SDK with service account key.
-// Only this side needs elevated write access; keeping it separate means
-// your primary credentials never touch the Admin SDK at all.
-function parsePrivateKey(raw) {
-  return raw.replace(/\\n/g, "\n");
-}
+// BACKUP — Admin SDK (service account). Writes only. One key, one side.
+function parsePrivateKey(raw) { return raw.replace(/\\n/g, "\n"); }
 
 const backupApp = admin.initializeApp(
   {
@@ -50,51 +44,206 @@ const backupApp = admin.initializeApp(
 );
 const backupDB = admin.firestore(backupApp);
 
-// ─────────────────────────────────────────────
-// 2. Configuration
-// ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. CONFIGURATION
+// ═════════════════════════════════════════════════════════════════════════════
 
 const COLLECTIONS = (process.env.COLLECTIONS || "customers,purchases,products")
-  .split(",")
-  .map((c) => c.trim())
-  .filter(Boolean);
+  .split(",").map((c) => c.trim()).filter(Boolean);
 
-// NOTE: Firestore reserves any collection/document ID matching __*__
-// (leading + trailing double underscore) and rejects it with
-// INVALID_ARGUMENT. Must NOT use that pattern here.
+// Metadata collection in the BACKUP Firestore database.
+// Layout:
+//   _backup_metadata/
+//     {collectionName}          — per-collection checksum + sync stats
+//     slot_{slotISO}            — per-slot retry state + full attempt log
 const METADATA_COLLECTION = "_backup_metadata";
 const PORT = process.env.PORT || 3000;
 
-// ─────────────────────────────────────────────
-// 3. Logger
-// ─────────────────────────────────────────────
+// Schedule: two slots per day in PHT.
+const BACKUP_HOUR_1 = parseInt(process.env.BACKUP_HOUR_1 ?? "5",  10); //  5 AM PHT
+const BACKUP_HOUR_2 = parseInt(process.env.BACKUP_HOUR_2 ?? "17", 10); // 5 PM PHT
+
+// Retry policy:
+//   • Within the first hour: up to MAX_CONSECUTIVE_FAILS fast attempts
+//     (CONSECUTIVE_RETRY_DELAY_MS apart). Fast retries handle transient errors.
+//   • After the first hour is exhausted: retry once per hour (anchored to the
+//     first attempt time, e.g. 5:12 → 6:12 → 7:12 …).
+//   • Stop when the slot age exceeds GRACE_HOURS (5 h). For a 5 PM slot that
+//     means the last allowed hourly window starts before 10 PM.
+const MAX_CONSECUTIVE_FAILS    = parseInt(process.env.MAX_CONSECUTIVE_FAILS    ?? "5",      10);
+const CONSECUTIVE_RETRY_DELAY  = parseInt(process.env.CONSECUTIVE_RETRY_DELAY  ?? "30000",  10); // ms between fast retries
+const GRACE_HOURS              = parseInt(process.env.GRACE_HOURS              ?? "5",      10); // max hours after slot
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. LOGGER
+// ═════════════════════════════════════════════════════════════════════════════
+
+function phNow() {
+  return new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" });
+}
 
 function log(level, message, data = null) {
-  const ts = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" });
-  const prefix = `[${ts}] [${level.toUpperCase()}]`;
-  if (data) {
-    console.log(`${prefix} ${message}`, JSON.stringify(data, null, 2));
-  } else {
-    console.log(`${prefix} ${message}`);
+  const prefix = `[${phNow()}] [${level.toUpperCase()}]`;
+  if (data) console.log(`${prefix} ${message}`, JSON.stringify(data, null, 2));
+  else      console.log(`${prefix} ${message}`);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. IN-MEMORY STATE
+// ═════════════════════════════════════════════════════════════════════════════
+
+const backupState = {
+  isRunning:   false,
+  lastRun:     null,
+  lastResults: null,
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. TIMEZONE HELPERS
+// ═════════════════════════════════════════════════════════════════════════════
+
+const PH_OFFSET_MINUTES = 8 * 60;
+
+function getPhWallClockParts(date) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Manila",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(date);
+  const m = {};
+  for (const p of parts) m[p.type] = p.value;
+  return {
+    year:   parseInt(m.year,   10),
+    month:  parseInt(m.month,  10),
+    day:    parseInt(m.day,    10),
+    hour:   parseInt(m.hour,   10) % 24,
+    minute: parseInt(m.minute, 10),
+  };
+}
+
+function phWallClockToUTC(year, month, day, hour, minute) {
+  return new Date(
+    Date.UTC(year, month - 1, day, hour, minute, 0) - PH_OFFSET_MINUTES * 60000
+  );
+}
+
+// Returns the most recent scheduled slot (as a true UTC Date) that is <= now.
+function getMostRecentSlot() {
+  const now = new Date();
+  const { year, month, day } = getPhWallClockParts(now);
+  const candidates = [];
+  for (const dayOffset of [0, -1]) {
+    const base = new Date(Date.UTC(year, month - 1, day + dayOffset));
+    for (const h of [BACKUP_HOUR_1, BACKUP_HOUR_2]) {
+      candidates.push(phWallClockToUTC(
+        base.getUTCFullYear(), base.getUTCMonth() + 1, base.getUTCDate(), h, 0
+      ));
+    }
+  }
+  const past = candidates.filter((d) => d <= now);
+  past.sort((a, b) => b - a);
+  return past[0];
+}
+
+// Slot deadline = slot time + GRACE_HOURS. No retries after this.
+function getSlotDeadline(slotDate) {
+  return new Date(slotDate.getTime() + GRACE_HOURS * 60 * 60 * 1000);
+}
+
+function getNextScheduledTime() {
+  const now  = new Date();
+  const phNowDate = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Manila" }));
+  const h    = phNowDate.getHours();
+  const m    = phNowDate.getMinutes();
+  let nextH;
+  if      (h < BACKUP_HOUR_1 || (h === BACKUP_HOUR_1 && m === 0)) nextH = BACKUP_HOUR_1;
+  else if (h < BACKUP_HOUR_2 || (h === BACKUP_HOUR_2 && m === 0)) nextH = BACKUP_HOUR_2;
+  else nextH = BACKUP_HOUR_1 + 24;
+  const next = new Date(phNowDate);
+  next.setHours(nextH, 0, 0, 0);
+  return next.toLocaleString("en-PH", { timeZone: "Asia/Manila" });
+}
+
+// Stable doc ID for the slot's metadata (safe for Firestore doc IDs).
+function slotDocId(slotDate) {
+  return "slot_" + slotDate.toISOString().replace(/[:.]/g, "-");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. SLOT METADATA (persisted in backup Firestore)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Document: _backup_metadata / slot_{slotISO}
+// {
+//   slotTime:              ISO string  — the scheduled slot this belongs to
+//   slotLabel:             "5:00 AM PHT 2026-06-30"  — human-readable
+//   status:                "pending" | "in_progress" | "success" | "abandoned"
+//   firstAttemptAt:        ISO string  — anchors the hourly retry schedule
+//   nextRetryAt:           ISO string  — when next hourly window opens (null if none)
+//   hourlyWindowIndex:     number      — 0 = first hour, 1 = second hour, …
+//   consecutiveFailsInWindow: number   — resets on each hourly window
+//   totalAttempts:         number
+//   lastAttemptAt:         ISO string
+//   lastAttemptStatus:     "success" | "all_collections_failed" | "partial"
+//   deadline:              ISO string  — slot + GRACE_HOURS, no retries after
+//   attempts: [            — append-only log of every attempt
+//     {
+//       attemptNumber:     number
+//       hourlyWindow:      number      — which hourly window (0-based)
+//       windowAttempt:     number      — attempt within that window (1-based)
+//       startedAt:         ISO string
+//       finishedAt:        ISO string
+//       elapsedSeconds:    string
+//       triggeredBy:       string
+//       status:            "success" | "all_failed" | "partial"
+//       totalReads:        number
+//       totalWrites:       number
+//       totalDeletes:      number
+//       collections: {
+//         [name]: { status, reads, writes, deletes, error? }
+//       }
+//     }
+//   ]
+// }
+
+async function readSlotMeta(slotDate) {
+  try {
+    const doc = await backupDB
+      .collection(METADATA_COLLECTION)
+      .doc(slotDocId(slotDate))
+      .get();
+    if (!doc.exists) return null;
+    return doc.data();
+  } catch (err) {
+    log("warn", `Could not read slot metadata: ${err.message}`);
+    return null;
   }
 }
 
-// ─────────────────────────────────────────────
-// 4. Backup state (for status endpoint)
-// ─────────────────────────────────────────────
+async function writeSlotMeta(slotDate, data) {
+  try {
+    await backupDB
+      .collection(METADATA_COLLECTION)
+      .doc(slotDocId(slotDate))
+      .set(data, { merge: true });
+  } catch (err) {
+    log("warn", `Could not write slot metadata: ${err.message}`);
+  }
+}
 
-const backupState = {
-  lastRun: null,
-  lastResults: null,
-  isRunning: false,
-  nextRun: null,
-};
+async function appendAttemptLog(slotDate, slotMeta, attemptRecord) {
+  // Firestore arrays can't be appended atomically with set+merge when using
+  // raw arrays, so we read the existing attempts array, push, then write back.
+  const existing = slotMeta?.attempts || [];
+  existing.push(attemptRecord);
+  await writeSlotMeta(slotDate, { attempts: existing });
+}
 
-// ─────────────────────────────────────────────
-// 5. Metadata Helpers
-// ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. PER-COLLECTION METADATA (checksum diffing)
+// ═════════════════════════════════════════════════════════════════════════════
 
-async function readBackupMetadata(collectionName) {
+async function readCollectionMeta(collectionName) {
   try {
     const doc = await backupDB
       .collection(METADATA_COLLECTION)
@@ -103,56 +252,25 @@ async function readBackupMetadata(collectionName) {
     if (!doc.exists) return null;
     return doc.data();
   } catch (err) {
-    log("warn", `Could not read metadata for [${collectionName}]: ${err.message}`);
+    log("warn", `Could not read collection metadata [${collectionName}]: ${err.message}`);
     return null;
   }
 }
 
-async function writeBackupMetadata(collectionName, metadata) {
-  await backupDB
-    .collection(METADATA_COLLECTION)
-    .doc(collectionName)
-    .set(metadata, { merge: true });
-}
-
-// Global "last run" marker — written every time runBackup() completes,
-// regardless of whether any collection actually had changes.
-// Per-collection lastSyncedAt only updates on writes, so it's NOT a
-// reliable signal for "did a backup attempt happen at 8/20". This is.
-const GLOBAL_META_DOC = "__global__";
-
-async function readLastGlobalRun() {
-  try {
-    const doc = await backupDB
-      .collection(METADATA_COLLECTION)
-      .doc(GLOBAL_META_DOC)
-      .get();
-    if (!doc.exists) return null;
-    const data = doc.data();
-    return data?.lastRunAt ? new Date(data.lastRunAt) : null;
-  } catch (err) {
-    log("warn", `Could not read global run marker: ${err.message}`);
-    return null;
-  }
-}
-
-async function writeLastGlobalRun(triggeredBy) {
+async function writeCollectionMeta(collectionName, metadata) {
   try {
     await backupDB
       .collection(METADATA_COLLECTION)
-      .doc(GLOBAL_META_DOC)
-      .set(
-        { lastRunAt: new Date().toISOString(), triggeredBy },
-        { merge: true }
-      );
+      .doc(collectionName)
+      .set(metadata, { merge: true });
   } catch (err) {
-    log("warn", `Could not write global run marker: ${err.message}`);
+    log("warn", `Could not write collection metadata [${collectionName}]: ${err.message}`);
   }
 }
 
-// ─────────────────────────────────────────────
-// 6. Core Sync Logic
-// ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. CORE SYNC LOGIC
+// ═════════════════════════════════════════════════════════════════════════════
 
 function buildChecksumMap(docs) {
   const map = {};
@@ -163,7 +281,7 @@ function buildChecksumMap(docs) {
       data?.updated_at?.toDate?.()?.toISOString() ||
       data?.createdAt?.toDate?.()?.toISOString() ||
       data?.created_at?.toDate?.()?.toISOString() ||
-      JSON.stringify(data).length.toString();
+      String(JSON.stringify(data).length);
     map[doc.id] = ts;
   }
   return map;
@@ -174,7 +292,7 @@ async function syncCollection(collectionName) {
 
   log("info", `━━━ Syncing collection: [${collectionName}] ━━━`);
 
-  const meta = await readBackupMetadata(collectionName);
+  const meta = await readCollectionMeta(collectionName);
   const previousChecksums = meta?.docChecksums || {};
   log("info", `  Metadata loaded. Previously tracked ${Object.keys(previousChecksums).length} docs.`);
 
@@ -185,42 +303,34 @@ async function syncCollection(collectionName) {
   } catch (err) {
     log("error", `  Failed to read primary [${collectionName}]: ${err.message}`);
     stats.status = "error";
+    stats.error = err.message;
     return stats;
   }
 
   if (primarySnapshot.empty) {
-    log("warn", `  [${collectionName}] is EMPTY in primary. Skipping to avoid data loss.`);
+    log("warn", `  [${collectionName}] is EMPTY in primary — skipping to avoid data loss.`);
     stats.status = "skipped_empty";
     return stats;
   }
 
-  const primaryDocs = primarySnapshot.docs;
+  const primaryDocs    = primarySnapshot.docs;
   const currentChecksums = buildChecksumMap(primaryDocs);
-
   const toUpsert = [];
   const toDelete = [];
 
   for (const doc of primaryDocs) {
-    const prev = previousChecksums[doc.id];
-    const curr = currentChecksums[doc.id];
-    if (prev !== curr) {
-      toUpsert.push(doc);
-    } else {
-      stats.skipped++;
-    }
+    if (previousChecksums[doc.id] !== currentChecksums[doc.id]) toUpsert.push(doc);
+    else stats.skipped++;
   }
-
   const currentIds = new Set(primaryDocs.map((d) => d.id));
   for (const oldId of Object.keys(previousChecksums)) {
-    if (!currentIds.has(oldId)) {
-      toDelete.push(oldId);
-    }
+    if (!currentIds.has(oldId)) toDelete.push(oldId);
   }
 
   log("info", `  Diff → upsert: ${toUpsert.length}, delete: ${toDelete.length}, unchanged: ${stats.skipped}`);
 
   if (toUpsert.length === 0 && toDelete.length === 0) {
-    log("info", `  No changes detected for [${collectionName}]. Nothing to write.`);
+    log("info", `  No changes detected for [${collectionName}].`);
     stats.status = "no_changes";
     return stats;
   }
@@ -231,8 +341,7 @@ async function syncCollection(collectionName) {
     const chunk = toUpsert.slice(i, i + BATCH_LIMIT);
     const batch = backupDB.batch();
     for (const doc of chunk) {
-      const ref = backupDB.collection(collectionName).doc(doc.id);
-      batch.set(ref, doc.data(), { merge: true });
+      batch.set(backupDB.collection(collectionName).doc(doc.id), doc.data(), { merge: true });
     }
     await batch.commit();
     stats.writes += chunk.length;
@@ -243,47 +352,57 @@ async function syncCollection(collectionName) {
     const chunk = toDelete.slice(i, i + BATCH_LIMIT);
     const batch = backupDB.batch();
     for (const docId of chunk) {
-      const ref = backupDB.collection(collectionName).doc(docId);
-      batch.delete(ref);
+      batch.delete(backupDB.collection(collectionName).doc(docId));
     }
     await batch.commit();
     stats.deletes += chunk.length;
     log("info", `  ✓ Deleted batch of ${chunk.length} stale docs.`);
   }
 
-  await writeBackupMetadata(collectionName, {
-    docChecksums: currentChecksums,
-    lastDocCount: primaryDocs.length,
-    lastSyncedAt: new Date().toISOString(),
+  await writeCollectionMeta(collectionName, {
+    docChecksums:  currentChecksums,
+    lastDocCount:  primaryDocs.length,
+    lastSyncedAt:  new Date().toISOString(),
     lastSyncStats: stats,
   });
 
-  log("info", `  ✓ Metadata updated for [${collectionName}].`);
+  log("info", `  ✓ Collection metadata updated for [${collectionName}].`);
   return stats;
 }
 
-// ─────────────────────────────────────────────
-// 7. Master Backup Runner
-// ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. MASTER BACKUP RUNNER
+// ═════════════════════════════════════════════════════════════════════════════
 
-async function runBackup(triggeredBy = "scheduled") {
+async function runBackup(triggeredBy, slotDate, slotMeta, attemptNumber, hourlyWindow, windowAttempt) {
   if (backupState.isRunning) {
-    log("warn", "Backup already in progress, skipping.");
-    return;
+    log("warn", "Backup already in progress — skipping.");
+    return null;
   }
 
   backupState.isRunning = true;
-  const startTime = Date.now();
-  const phTime = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" });
+  const startedAt  = new Date();
+  const startMs    = startedAt.getTime();
+  const startLabel = startedAt.toLocaleString("en-PH", { timeZone: "Asia/Manila" });
 
-  log("info", "╔══════════════════════════════════════════╗");
-  log("info", "║       FIREBASE POS BACKUP STARTED        ║");
-  log("info", `║  ${phTime.padEnd(40)}║`);
-  log("info", `║  Triggered by: ${triggeredBy.padEnd(27)}║`);
-  log("info", "╚══════════════════════════════════════════╝");
+  log("info", "╔══════════════════════════════════════════════╗");
+  log("info", "║         FIREBASE POS BACKUP STARTED          ║");
+  log("info", `║  ${startLabel.padEnd(44)}║`);
+  log("info", `║  Triggered by : ${triggeredBy.padEnd(29)}║`);
+  log("info", `║  Attempt      : #${String(attemptNumber).padEnd(28)}║`);
+  log("info", `║  Hourly window: ${String(hourlyWindow).padEnd(29)}║`);
+  log("info", `║  Window try   : ${String(windowAttempt).padEnd(29)}║`);
+  log("info", "╚══════════════════════════════════════════════╝");
+
+  // Write "in_progress" to Firestore immediately so we have a record even
+  // if the process crashes mid-backup.
+  await writeSlotMeta(slotDate, {
+    status:          "in_progress",
+    lastAttemptAt:   startedAt.toISOString(),
+    totalAttempts:   attemptNumber,
+  });
 
   const results = {};
-
   for (const col of COLLECTIONS) {
     try {
       results[col] = await syncCollection(col);
@@ -293,259 +412,275 @@ async function runBackup(triggeredBy = "scheduled") {
     }
   }
 
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+  const finishedAt     = new Date();
+  const elapsedSeconds = ((finishedAt - startMs) / 1000).toFixed(2);
 
   let totalReads = 0, totalWrites = 0, totalDeletes = 0;
-  for (const stat of Object.values(results)) {
-    totalReads += stat.reads || 0;
-    totalWrites += stat.writes || 0;
-    totalDeletes += stat.deletes || 0;
+  for (const s of Object.values(results)) {
+    totalReads   += s.reads   || 0;
+    totalWrites  += s.writes  || 0;
+    totalDeletes += s.deletes || 0;
   }
 
-  log("info", `Backup complete — reads: ${totalReads}, writes: ${totalWrites}, deletes: ${totalDeletes}, elapsed: ${elapsed}s`);
+  const allFailed  = Object.values(results).every((r) => r.status === "error" || r.status === "fatal_error");
+  const anyFailed  = Object.values(results).some((r)  => r.status === "error" || r.status === "fatal_error");
+  const runStatus  = allFailed ? "all_failed" : anyFailed ? "partial" : "success";
 
-  backupState.lastRun = new Date().toISOString();
-  backupState.lastResults = { results, totalReads, totalWrites, totalDeletes, elapsedSeconds: elapsed, triggeredBy };
+  log("info", `Backup ${runStatus} — reads: ${totalReads}, writes: ${totalWrites}, deletes: ${totalDeletes}, elapsed: ${elapsedSeconds}s`);
 
-  await writeLastGlobalRun(triggeredBy);
-
-  backupState.isRunning = false;
-}
-
-// ─────────────────────────────────────────────
-// 8. Time-gate
-// ─────────────────────────────────────────────
-
-function isBackupTime() {
-  const now = new Date();
-  const phHour = parseInt(
-    now.toLocaleString("en-PH", { timeZone: "Asia/Manila", hour: "numeric", hour12: false }),
-    10
-  );
-  const phMinute = parseInt(
-    now.toLocaleString("en-PH", { timeZone: "Asia/Manila", minute: "numeric" }),
-    10
-  );
-
-  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "5", 10);
-  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "17", 10);
-
-  return phMinute === 0 && (phHour === hour1 || phHour === hour2);
-}
-
-function getNextBackupTime() {
-  const now = new Date();
-  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "5", 10);
-  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "17", 10);
-
-  const phNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Manila" }));
-  const phHour = phNow.getHours();
-  const phMin = phNow.getMinutes();
-
-  let nextHour;
-  if (phHour < hour1 || (phHour === hour1 && phMin === 0)) nextHour = hour1;
-  else if (phHour < hour2 || (phHour === hour2 && phMin === 0)) nextHour = hour2;
-  else nextHour = hour1 + 24;
-
-  const next = new Date(phNow);
-  next.setHours(nextHour, 0, 0, 0);
-  return next.toLocaleString("en-PH", { timeZone: "Asia/Manila" });
-}
-
-// Returns a real JS Date (true UTC instant) for the most recent scheduled
-// slot (8/20 PHT by default) that is <= now. PH has a fixed UTC+8 offset
-// (no DST), so we convert PH wall-clock parts to a UTC instant explicitly
-// rather than relying on locale-string round-tripping, which silently
-// produces wrong deltas when the server's own timezone isn't UTC/PH.
-const PH_OFFSET_MINUTES = 8 * 60;
-
-function getPhWallClockParts(date) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Asia/Manila",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(date);
-  const map = {};
-  for (const p of parts) map[p.type] = p.value;
-  return {
-    year: parseInt(map.year, 10),
-    month: parseInt(map.month, 10),
-    day: parseInt(map.day, 10),
-    hour: parseInt(map.hour, 10) % 24, // Intl can emit "24" for midnight
-    minute: parseInt(map.minute, 10),
+  // Build the attempt log entry.
+  const attemptRecord = {
+    attemptNumber,
+    hourlyWindow,
+    windowAttempt,
+    triggeredBy,
+    startedAt:      startedAt.toISOString(),
+    startedAtPHT:   startLabel,
+    finishedAt:     finishedAt.toISOString(),
+    finishedAtPHT:  finishedAt.toLocaleString("en-PH", { timeZone: "Asia/Manila" }),
+    elapsedSeconds,
+    status:         runStatus,
+    totalReads,
+    totalWrites,
+    totalDeletes,
+    collections:    Object.fromEntries(
+      Object.entries(results).map(([k, v]) => [k, {
+        status:  v.status,
+        reads:   v.reads   || 0,
+        writes:  v.writes  || 0,
+        deletes: v.deletes || 0,
+        ...(v.error ? { error: v.error } : {}),
+      }])
+    ),
   };
+
+  // Persist the attempt log + updated slot state.
+  await appendAttemptLog(slotDate, slotMeta, attemptRecord);
+
+  backupState.isRunning  = false;
+  backupState.lastRun    = finishedAt.toISOString();
+  backupState.lastResults = { attemptRecord, triggeredBy };
+
+  return attemptRecord;
 }
 
-// Builds the true UTC instant corresponding to a given PH wall-clock time.
-function phWallClockToUTC(year, month, day, hour, minute) {
-  return new Date(
-    Date.UTC(year, month - 1, day, hour, minute, 0) - PH_OFFSET_MINUTES * 60000
-  );
-}
+// ═════════════════════════════════════════════════════════════════════════════
+// 10. RETRY ORCHESTRATOR
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// State machine persisted in Firestore (_backup_metadata/slot_{id}):
+//
+//   [slot fires or server wakes within grace window]
+//        │
+//        ▼
+//   Read slot metadata from Firestore
+//        │
+//        ├── status = "success"  ──────────────────────────► Done for this slot
+//        │
+//        ├── status = "abandoned" ─────────────────────────► Done for this slot
+//        │
+//        └── status = "pending" | "in_progress" | null
+//                 │
+//                 ▼
+//        Are we past the slot deadline (slot + 5 h)?
+//                 │
+//                 ├── Yes ──► Mark abandoned, stop
+//                 │
+//                 └── No
+//                          │
+//                          ▼
+//                 Do we have a firstAttemptAt?
+//                          │
+//                          ├── No  ──► Run now (window 0, attempt 1)
+//                          │
+//                          └── Yes
+//                                   │
+//                                   ▼
+//                          Are we in a new hourly window?
+//                          (now >= firstAttemptAt + windowIndex*1h)
+//                                   │
+//                                   ├── No  ──► Have we hit MAX_CONSECUTIVE_FAILS?
+//                                   │           ├── No  ──► Run now (same window)
+//                                   │           └── Yes ──► Wait for next window
+//                                   │
+//                                   └── Yes ──► Open new window, run now
 
-function getMostRecentScheduledSlot() {
-  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "5", 10);
-  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "17", 10);
+let orchestratorInFlight = false;
 
-  const now = new Date();
-  const { year, month, day } = getPhWallClockParts(now);
+async function runSlotOrchestrator(triggeredBy) {
+  if (backupState.isRunning || orchestratorInFlight) return;
+  orchestratorInFlight = true;
 
-  const candidates = [];
-  // Check today's two slots and yesterday's two slots — covers all cases
-  // (e.g. it's 1 AM PHT, so the most recent slot was yesterday 8 PM PHT).
-  for (const dayOffset of [0, -1]) {
-    // Use a UTC-space Date purely to do safe calendar-day arithmetic.
-    const dayBase = new Date(Date.UTC(year, month - 1, day + dayOffset));
-    for (const h of [hour1, hour2]) {
-      candidates.push(
-        phWallClockToUTC(
-          dayBase.getUTCFullYear(),
-          dayBase.getUTCMonth() + 1,
-          dayBase.getUTCDate(),
-          h,
-          0
-        )
-      );
-    }
-  }
-
-  const pastSlots = candidates.filter((d) => d.getTime() <= now.getTime());
-  pastSlots.sort((a, b) => b.getTime() - a.getTime());
-  return pastSlots[0];
-}
-
-// Grace window (minutes) after a scheduled slot during which a missed
-// backup will still be caught up if the server was asleep at the exact time.
-const CATCHUP_GRACE_MINUTES = parseInt(process.env.CATCHUP_GRACE_MINUTES ?? "180", 10);
-
-let catchUpCheckInFlight = false;
-
-// ─── Circuit breaker ───────────────────────────────────────────────────────
-// Tracks consecutive catch-up failures per scheduled slot (keyed by slot
-// ISO string). After MAX_CATCHUP_ATTEMPTS the service stops retrying for
-// that slot so it doesn't hammer Firestore quota every cron tick.
-const MAX_CATCHUP_ATTEMPTS = parseInt(process.env.MAX_CATCHUP_ATTEMPTS ?? "5", 10);
-const catchUpAttempts = {}; // { slotISO: number }
-
-// Call this from the cron tick AND from incoming HTTP requests.
-// Cheap by design — only does a Firestore read (readLastGlobalRun) unless
-// a catch-up is actually warranted.
-async function checkAndRunCatchUp(triggeredBy) {
-  if (backupState.isRunning || catchUpCheckInFlight) return;
-
-  catchUpCheckInFlight = true;
   try {
-    const mostRecentSlot = getMostRecentScheduledSlot();
-    const slotKey = mostRecentSlot.toISOString();
-    const minutesSinceSlot = (Date.now() - mostRecentSlot.getTime()) / 60000;
+    const now  = new Date();
+    const slot = getMostRecentSlot();
+    if (!slot) return;
 
-    if (minutesSinceSlot > CATCHUP_GRACE_MINUTES) {
-      // Too late — don't run a backup hours late just because someone
-      // visited the site; wait for the next real scheduled slot instead.
+    const deadline         = getSlotDeadline(slot);
+    const slotLabelPHT     = slot.toLocaleString("en-PH", { timeZone: "Asia/Manila" });
+    const deadlineLabelPHT = deadline.toLocaleString("en-PH", { timeZone: "Asia/Manila" });
+
+    // ── Past the grace window entirely? ────────────────────────────────────
+    if (now >= deadline) return; // Silent — we just wait for the next slot.
+
+    // ── Read current slot state from Firestore ──────────────────────────────
+    let meta = await readSlotMeta(slot);
+
+    // ── Already succeeded or abandoned? ────────────────────────────────────
+    if (meta?.status === "success" || meta?.status === "abandoned") return;
+
+    // ── First ever attempt for this slot? ──────────────────────────────────
+    if (!meta || !meta.firstAttemptAt) {
+      log("info", `Slot ${slotLabelPHT}: first attempt. Deadline: ${deadlineLabelPHT}.`);
+
+      const initMeta = {
+        slotTime:                 slot.toISOString(),
+        slotTimePHT:              slotLabelPHT,
+        deadline:                 deadline.toISOString(),
+        deadlinePHT:              deadlineLabelPHT,
+        status:                   "pending",
+        firstAttemptAt:           now.toISOString(),
+        nextRetryAt:              null,
+        hourlyWindowIndex:        0,
+        consecutiveFailsInWindow: 0,
+        totalAttempts:            0,
+        lastAttemptAt:            null,
+        lastAttemptStatus:        null,
+        attempts:                 [],
+      };
+      await writeSlotMeta(slot, initMeta);
+      meta = initMeta;
+    }
+
+    // ── Determine current hourly window ────────────────────────────────────
+    const firstAttemptAt  = new Date(meta.firstAttemptAt);
+    const msSinceFirst    = now - firstAttemptAt;
+    const currentWindow   = Math.floor(msSinceFirst / (60 * 60 * 1000)); // 0, 1, 2 …
+    const lastWindow      = meta.hourlyWindowIndex ?? 0;
+    const failsInWindow   = meta.consecutiveFailsInWindow ?? 0;
+    const totalAttempts   = meta.totalAttempts ?? 0;
+
+    // Opening a new hourly window?
+    const newWindowOpen = currentWindow > lastWindow;
+
+    if (!newWindowOpen && failsInWindow >= MAX_CONSECUTIVE_FAILS) {
+      // Still in the same window and already hit the consecutive fail limit.
+      // nextRetryAt tells us when the next window opens.
+      const nextRetryAt = meta.nextRetryAt ? new Date(meta.nextRetryAt) : null;
+      const waitMin = nextRetryAt ? Math.ceil((nextRetryAt - now) / 60000) : "?";
+      log("info", `Slot ${slotLabelPHT}: window ${lastWindow} exhausted (${failsInWindow}/${MAX_CONSECUTIVE_FAILS} fails). Next retry in ~${waitMin} min.`);
       return;
     }
 
-    // Circuit breaker: stop retrying after MAX_CATCHUP_ATTEMPTS failures
-    const attempts = catchUpAttempts[slotKey] || 0;
-    if (attempts >= MAX_CATCHUP_ATTEMPTS) {
-      if (attempts === MAX_CATCHUP_ATTEMPTS) {
-        // Log only once when the limit is first hit to avoid log spam
-        log(
-          "warn",
-          `Circuit breaker: reached ${MAX_CATCHUP_ATTEMPTS} failed catch-up attempts for slot ${mostRecentSlot.toLocaleString("en-PH", { timeZone: "Asia/Manila" })}. Halting retries for this slot. Will resume at the next scheduled slot.`
-        );
-        catchUpAttempts[slotKey] = MAX_CATCHUP_ATTEMPTS + 1; // sentinel so we only log once
-      }
-      return;
+    // ── Decide window index and window-attempt counter ──────────────────────
+    let windowIndex, windowAttempt;
+    if (newWindowOpen) {
+      windowIndex   = currentWindow;
+      windowAttempt = 1;
+      log("info", `Slot ${slotLabelPHT}: opening hourly window ${windowIndex} (retry hour ${windowIndex}).`);
+      // Reset consecutive fail counter for the new window in Firestore.
+      await writeSlotMeta(slot, {
+        hourlyWindowIndex:        windowIndex,
+        consecutiveFailsInWindow: 0,
+      });
+      // Re-read so the attempt log append later has fresh data.
+      meta = await readSlotMeta(slot) || meta;
+      meta.consecutiveFailsInWindow = 0;
+      meta.hourlyWindowIndex        = windowIndex;
+    } else {
+      windowIndex   = lastWindow;
+      windowAttempt = failsInWindow + 1;
     }
 
-    const lastGlobalRun = await readLastGlobalRun();
+    const attemptNumber = totalAttempts + 1;
 
-    if (lastGlobalRun && lastGlobalRun.getTime() >= mostRecentSlot.getTime()) {
-      // Already ran for this slot (either on time, or already caught up).
-      // Reset the counter — this slot succeeded.
-      delete catchUpAttempts[slotKey];
-      return;
-    }
-
-    log(
-      "warn",
-      `Catch-up: missed scheduled backup for ${mostRecentSlot.toLocaleString("en-PH", { timeZone: "Asia/Manila" })}. Running now (triggered by ${triggeredBy}). Attempt ${attempts + 1}/${MAX_CATCHUP_ATTEMPTS}.`
+    // ── Run the actual backup ───────────────────────────────────────────────
+    const record = await runBackup(
+      triggeredBy, slot, meta,
+      attemptNumber, windowIndex, windowAttempt
     );
+    if (!record) return; // was already running
 
-    catchUpAttempts[slotKey] = attempts + 1;
-    await runBackup(`catchup:${triggeredBy}`);
+    const succeeded = record.status === "success";
+    const newFails  = succeeded ? 0 : (meta.consecutiveFailsInWindow ?? 0) + 1;
 
-    // If runBackup completed without throwing, check if all collections
-    // actually errored (quota hit). If so, don't reset the counter so the
-    // circuit breaker still trips on the next tick.
-    const lastResults = backupState.lastResults;
-    const allFailed =
-      lastResults &&
-      Object.values(lastResults.results || {}).every((r) => r.status === "error");
+    // ── Compute next retry window time ─────────────────────────────────────
+    // Anchored to firstAttemptAt so retries are exactly 1 h apart regardless
+    // of how long the backup itself takes.
+    const nextWindowStart = new Date(firstAttemptAt.getTime() + (windowIndex + 1) * 60 * 60 * 1000);
+    const nextRetryAt     = nextWindowStart < deadline ? nextWindowStart.toISOString() : null;
 
-    if (!allFailed) {
-      delete catchUpAttempts[slotKey]; // success — reset
+    // ── Persist updated slot state ──────────────────────────────────────────
+    const updatedSlotMeta = {
+      status:                   succeeded ? "success" : (nextRetryAt ? "pending" : "abandoned"),
+      lastAttemptAt:            record.finishedAt,
+      lastAttemptAtPHT:         record.finishedAtPHT,
+      lastAttemptStatus:        record.status,
+      totalAttempts:            attemptNumber,
+      consecutiveFailsInWindow: newFails,
+      nextRetryAt:              succeeded ? null : nextRetryAt,
+      nextRetryAtPHT:           (succeeded || !nextRetryAt) ? null
+        : new Date(nextRetryAt).toLocaleString("en-PH", { timeZone: "Asia/Manila" }),
+    };
+    await writeSlotMeta(slot, updatedSlotMeta);
+
+    if (succeeded) {
+      log("info", `✅ Slot ${slotLabelPHT}: backup succeeded on attempt #${attemptNumber}.`);
+    } else if (!nextRetryAt) {
+      log("warn", `⛔ Slot ${slotLabelPHT}: all retry windows exhausted (deadline ${deadlineLabelPHT}). Marking abandoned.`);
+    } else if (newFails >= MAX_CONSECUTIVE_FAILS) {
+      log("warn", `⚠️  Slot ${slotLabelPHT}: window ${windowIndex} exhausted (${newFails}/${MAX_CONSECUTIVE_FAILS} fails). Next hourly retry at ${new Date(nextRetryAt).toLocaleString("en-PH", { timeZone: "Asia/Manila" })}.`);
+    } else {
+      log("warn", `↩️  Slot ${slotLabelPHT}: attempt #${attemptNumber} failed (${newFails}/${MAX_CONSECUTIVE_FAILS}). Will retry in window ${windowIndex} again.`);
     }
+
   } catch (err) {
-    log("error", `Catch-up check failed: ${err.message}`);
+    log("error", `Orchestrator error: ${err.message}`);
   } finally {
-    catchUpCheckInFlight = false;
+    orchestratorInFlight = false;
   }
 }
 
-// ─────────────────────────────────────────────
-// 9. HTTP Server (required for Render Web Service)
-// ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 11. HTTP SERVER
+// ═════════════════════════════════════════════════════════════════════════════
 
 const server = http.createServer((req, res) => {
   const url = req.url;
 
-  // Health check — Render pings this to keep the service alive.
-  // Also doubles as a wake-up trigger: if the server was asleep through
-  // a scheduled backup time, visiting this fires a catch-up check.
   if (url === "/" || url === "/health") {
-    checkAndRunCatchUp("http_health_check").catch((err) =>
-      log("error", `Catch-up trigger error: ${err.message}`)
+    runSlotOrchestrator("http_health_check").catch((err) =>
+      log("error", `Orchestrator trigger error: ${err.message}`)
     );
-
-    const phTime = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
-      status: "ok",
-      service: "Firebase POS Backup",
-      currentTimePHT: phTime,
-      nextBackup: getNextBackupTime(),
-      isRunning: backupState.isRunning,
-      lastRun: backupState.lastRun,
+      status:         "ok",
+      service:        "Firebase POS Backup",
+      currentTimePHT: phNow(),
+      nextBackup:     getNextScheduledTime(),
+      isRunning:      backupState.isRunning,
+      lastRun:        backupState.lastRun,
     }));
     return;
   }
 
-  // Status page — shows last backup results
   if (url === "/status") {
-    checkAndRunCatchUp("http_status_check").catch((err) =>
-      log("error", `Catch-up trigger error: ${err.message}`)
+    runSlotOrchestrator("http_status_check").catch((err) =>
+      log("error", `Orchestrator trigger error: ${err.message}`)
     );
-
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
-      service: "Firebase POS Backup",
-      collections: COLLECTIONS,
-      currentTimePHT: new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila" }),
-      nextBackup: getNextBackupTime(),
-      isRunning: backupState.isRunning,
-      lastRun: backupState.lastRun,
-      lastResults: backupState.lastResults,
+      service:        "Firebase POS Backup",
+      collections:    COLLECTIONS,
+      currentTimePHT: phNow(),
+      nextBackup:     getNextScheduledTime(),
+      isRunning:      backupState.isRunning,
+      lastRun:        backupState.lastRun,
+      lastResults:    backupState.lastResults,
     }, null, 2));
     return;
   }
 
-  // Manual trigger — useful for testing
   if (url === "/trigger" && req.method === "POST") {
     if (backupState.isRunning) {
       res.writeHead(409, { "Content-Type": "application/json" });
@@ -554,7 +689,9 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(202, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ message: "Backup triggered manually" }));
-    runBackup("manual").catch((err) => log("error", `Manual trigger error: ${err.message}`));
+    runSlotOrchestrator("manual_trigger").catch((err) =>
+      log("error", `Manual trigger error: ${err.message}`)
+    );
     return;
   }
 
@@ -564,34 +701,26 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   log("info", `HTTP server listening on port ${PORT}`);
-  log("info", `  GET  /health  — health check`);
+  log("info", `  GET  /health  — health check + catch-up trigger`);
   log("info", `  GET  /status  — last backup results`);
   log("info", `  POST /trigger — run backup now (for testing)`);
 });
 
-// ─────────────────────────────────────────────
-// 10. Cron Schedule
-// ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 12. CRON — fires every minute, orchestrator decides what to do
+// ═════════════════════════════════════════════════════════════════════════════
 
 log("info", "Firebase POS Backup Service starting...");
-log("info", `Scheduled: 05:00 PHT and 17:00 PHT daily`);
-log("info", `Collections: ${COLLECTIONS.join(", ")}`);
+log("info", `Scheduled slots : ${BACKUP_HOUR_1}:00 PHT and ${BACKUP_HOUR_2}:00 PHT daily`);
+log("info", `Grace window    : ${GRACE_HOURS} hours per slot`);
+log("info", `Fast retry      : up to ${MAX_CONSECUTIVE_FAILS} consecutive attempts per hourly window`);
+log("info", `Collections     : ${COLLECTIONS.join(", ")}`);
 
 cron.schedule(
   "* * * * *",
-  async () => {
-    if (isBackupTime()) {
-      try {
-        await runBackup("scheduled");
-      } catch (err) {
-        log("error", `Fatal backup error: ${err.message}`);
-      }
-      return;
-    }
-    // Fallback: server was awake but for some reason missed the exact
-    // :00 minute (e.g. brief downtime, deploy restart, clock drift).
-    checkAndRunCatchUp("cron_tick").catch((err) =>
-      log("error", `Catch-up trigger error: ${err.message}`)
+  () => {
+    runSlotOrchestrator("cron_tick").catch((err) =>
+      log("error", `Cron orchestrator error: ${err.message}`)
     );
   },
   { timezone: "Asia/Manila" }
