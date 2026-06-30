@@ -1,5 +1,11 @@
 require("dotenv").config();
 const admin = require("firebase-admin");
+const { initializeApp: initClientApp } = require("firebase/app");
+const {
+  getFirestore: getClientFirestore,
+  collection: fsCollection,
+  getDocs,
+} = require("firebase/firestore");
 const cron = require("node-cron");
 const http = require("http");
 
@@ -7,33 +13,41 @@ const http = require("http");
 // 1. Firebase App Initialization
 // ─────────────────────────────────────────────
 
+// PRIMARY — client SDK with your web config.
+// Reads are governed by your public Firestore security rules, which acts
+// as a natural safety guard: if these credentials are ever accidentally
+// swapped to point at the empty backup DB, the rules there will deny reads
+// (or return nothing), preventing a blank overwrite of your primary data.
+const primaryClientApp = initClientApp(
+  {
+    apiKey:            process.env.PRIMARY_API_KEY,
+    authDomain:        process.env.PRIMARY_AUTH_DOMAIN,
+    projectId:         process.env.PRIMARY_PROJECT_ID,
+    storageBucket:     process.env.PRIMARY_STORAGE_BUCKET,
+    messagingSenderId: process.env.PRIMARY_MESSAGING_SENDER_ID,
+    appId:             process.env.PRIMARY_APP_ID,
+  },
+  "primary-client"
+);
+const primaryDB = getClientFirestore(primaryClientApp);
+
+// BACKUP — Admin SDK with service account key.
+// Only this side needs elevated write access; keeping it separate means
+// your primary credentials never touch the Admin SDK at all.
 function parsePrivateKey(raw) {
   return raw.replace(/\\n/g, "\n");
 }
 
-const primaryApp = admin.initializeApp(
-  {
-    credential: admin.credential.cert({
-      projectId: process.env.PRIMARY_PROJECT_ID,
-      clientEmail: process.env.PRIMARY_CLIENT_EMAIL,
-      privateKey: parsePrivateKey(process.env.PRIMARY_PRIVATE_KEY),
-    }),
-  },
-  "primary"
-);
-
 const backupApp = admin.initializeApp(
   {
     credential: admin.credential.cert({
-      projectId: process.env.BACKUP_PROJECT_ID,
+      projectId:   process.env.BACKUP_PROJECT_ID,
       clientEmail: process.env.BACKUP_CLIENT_EMAIL,
-      privateKey: parsePrivateKey(process.env.BACKUP_PRIVATE_KEY),
+      privateKey:  parsePrivateKey(process.env.BACKUP_PRIVATE_KEY),
     }),
   },
   "backup"
 );
-
-const primaryDB = admin.firestore(primaryApp);
 const backupDB = admin.firestore(backupApp);
 
 // ─────────────────────────────────────────────
@@ -166,7 +180,7 @@ async function syncCollection(collectionName) {
 
   let primarySnapshot;
   try {
-    primarySnapshot = await primaryDB.collection(collectionName).get();
+    primarySnapshot = await getDocs(fsCollection(primaryDB, collectionName));
     stats.reads += primarySnapshot.size;
   } catch (err) {
     log("error", `  Failed to read primary [${collectionName}]: ${err.message}`);
@@ -313,16 +327,16 @@ function isBackupTime() {
     10
   );
 
-  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "8", 10);
-  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "20", 10);
+  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "5", 10);
+  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "17", 10);
 
   return phMinute === 0 && (phHour === hour1 || phHour === hour2);
 }
 
 function getNextBackupTime() {
   const now = new Date();
-  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "8", 10);
-  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "20", 10);
+  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "5", 10);
+  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "17", 10);
 
   const phNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Manila" }));
   const phHour = phNow.getHours();
@@ -374,8 +388,8 @@ function phWallClockToUTC(year, month, day, hour, minute) {
 }
 
 function getMostRecentScheduledSlot() {
-  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "8", 10);
-  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "20", 10);
+  const hour1 = parseInt(process.env.BACKUP_HOUR_1 ?? "5", 10);
+  const hour2 = parseInt(process.env.BACKUP_HOUR_2 ?? "17", 10);
 
   const now = new Date();
   const { year, month, day } = getPhWallClockParts(now);
@@ -410,6 +424,13 @@ const CATCHUP_GRACE_MINUTES = parseInt(process.env.CATCHUP_GRACE_MINUTES ?? "180
 
 let catchUpCheckInFlight = false;
 
+// ─── Circuit breaker ───────────────────────────────────────────────────────
+// Tracks consecutive catch-up failures per scheduled slot (keyed by slot
+// ISO string). After MAX_CATCHUP_ATTEMPTS the service stops retrying for
+// that slot so it doesn't hammer Firestore quota every cron tick.
+const MAX_CATCHUP_ATTEMPTS = parseInt(process.env.MAX_CATCHUP_ATTEMPTS ?? "5", 10);
+const catchUpAttempts = {}; // { slotISO: number }
+
 // Call this from the cron tick AND from incoming HTTP requests.
 // Cheap by design — only does a Firestore read (readLastGlobalRun) unless
 // a catch-up is actually warranted.
@@ -419,6 +440,7 @@ async function checkAndRunCatchUp(triggeredBy) {
   catchUpCheckInFlight = true;
   try {
     const mostRecentSlot = getMostRecentScheduledSlot();
+    const slotKey = mostRecentSlot.toISOString();
     const minutesSinceSlot = (Date.now() - mostRecentSlot.getTime()) / 60000;
 
     if (minutesSinceSlot > CATCHUP_GRACE_MINUTES) {
@@ -427,18 +449,48 @@ async function checkAndRunCatchUp(triggeredBy) {
       return;
     }
 
+    // Circuit breaker: stop retrying after MAX_CATCHUP_ATTEMPTS failures
+    const attempts = catchUpAttempts[slotKey] || 0;
+    if (attempts >= MAX_CATCHUP_ATTEMPTS) {
+      if (attempts === MAX_CATCHUP_ATTEMPTS) {
+        // Log only once when the limit is first hit to avoid log spam
+        log(
+          "warn",
+          `Circuit breaker: reached ${MAX_CATCHUP_ATTEMPTS} failed catch-up attempts for slot ${mostRecentSlot.toLocaleString("en-PH", { timeZone: "Asia/Manila" })}. Halting retries for this slot. Will resume at the next scheduled slot.`
+        );
+        catchUpAttempts[slotKey] = MAX_CATCHUP_ATTEMPTS + 1; // sentinel so we only log once
+      }
+      return;
+    }
+
     const lastGlobalRun = await readLastGlobalRun();
 
     if (lastGlobalRun && lastGlobalRun.getTime() >= mostRecentSlot.getTime()) {
       // Already ran for this slot (either on time, or already caught up).
+      // Reset the counter — this slot succeeded.
+      delete catchUpAttempts[slotKey];
       return;
     }
 
     log(
       "warn",
-      `Catch-up: missed scheduled backup for ${mostRecentSlot.toLocaleString("en-PH", { timeZone: "Asia/Manila" })}. Running now (triggered by ${triggeredBy}).`
+      `Catch-up: missed scheduled backup for ${mostRecentSlot.toLocaleString("en-PH", { timeZone: "Asia/Manila" })}. Running now (triggered by ${triggeredBy}). Attempt ${attempts + 1}/${MAX_CATCHUP_ATTEMPTS}.`
     );
+
+    catchUpAttempts[slotKey] = attempts + 1;
     await runBackup(`catchup:${triggeredBy}`);
+
+    // If runBackup completed without throwing, check if all collections
+    // actually errored (quota hit). If so, don't reset the counter so the
+    // circuit breaker still trips on the next tick.
+    const lastResults = backupState.lastResults;
+    const allFailed =
+      lastResults &&
+      Object.values(lastResults.results || {}).every((r) => r.status === "error");
+
+    if (!allFailed) {
+      delete catchUpAttempts[slotKey]; // success — reset
+    }
   } catch (err) {
     log("error", `Catch-up check failed: ${err.message}`);
   } finally {
@@ -522,7 +574,7 @@ server.listen(PORT, () => {
 // ─────────────────────────────────────────────
 
 log("info", "Firebase POS Backup Service starting...");
-log("info", `Scheduled: 08:00 PHT and 20:00 PHT daily`);
+log("info", `Scheduled: 05:00 PHT and 17:00 PHT daily`);
 log("info", `Collections: ${COLLECTIONS.join(", ")}`);
 
 cron.schedule(
